@@ -251,7 +251,8 @@ def requests_used_today() -> int:
 
 def usage_summary() -> str:
     """One line for the user, e.g. '7 of 20 requests used today'."""
-    return f"{requests_used_today()} of {DAILY_LIMIT} requests used today"
+    line = f"{requests_used_today()} of {DAILY_LIMIT} requests used today"
+    return f"{line} (fake LLM: nothing was counted)" if is_fake() else line
 
 
 def reserve_request() -> int:
@@ -505,6 +506,7 @@ class State(TypedDict, total=False):
     research_enabled: bool
     images_enabled: bool
     use_cache: bool
+    plan_only: bool  # stop after planning (saves requests)
 
 
 # =============================================================================
@@ -589,6 +591,8 @@ def orchestrator(state: State) -> dict:
 
 def fan_out(state: State) -> list[Send]:
     """Conditional edge: send one worker per task in the plan. They run in parallel."""
+    if state.get("plan_only"):
+        return []  # nothing to write: the run ends after the plan
     return [
         Send(
             "worker",
@@ -666,8 +670,20 @@ def build_graph():
     return graph.compile()
 
 
-def initial_state(topic: str, *, use_cache: bool = True) -> State:
-    """The state a run starts from."""
+def research_available() -> bool:
+    """Web research needs a Tavily key."""
+    return bool(os.getenv("TAVILY_API_KEY"))
+
+
+def initial_state(
+    topic: str,
+    *,
+    research: bool = False,
+    images: bool = False,
+    use_cache: bool = True,
+    plan_only: bool = False,
+) -> State:
+    """The state a run starts from. Research stays off unless a Tavily key exists."""
     return {
         "topic": topic,
         "mode": "closed_book",
@@ -678,9 +694,10 @@ def initial_state(topic: str, *, use_cache: bool = True) -> State:
         "sections": [],
         "final_markdown": "",
         "file_path": "",
-        "research_enabled": False,
-        "images_enabled": False,
+        "research_enabled": research and research_available(),
+        "images_enabled": images,
         "use_cache": use_cache,
+        "plan_only": plan_only,
     }
 
 
@@ -735,7 +752,7 @@ def smoke_test() -> None:
         use_cache=False,  # the point is to hit the real model
     )
     print(f"Reply: ok={reply.ok}, message={reply.message!r}")
-    print(f"Smoke test passed. {usage_summary()}.")
+    print("Smoke test passed.")
 
 
 def print_plan(plan: Plan) -> None:
@@ -757,28 +774,52 @@ def print_progress(node: str, update: dict) -> None:
         print(f"  [{node}] done")
 
 
+def generate(args: argparse.Namespace) -> None:
+    """Run the agent for one topic and print the result."""
+    if args.research or args.images:
+        print("Note: --research and --images are accepted but not active yet.")
+    state = initial_state(
+        args.topic,
+        research=args.research,
+        images=args.images,
+        use_cache=not args.no_cache,
+        plan_only=args.plan_only,
+    )
+    final = run_blog(build_graph(), state, print_progress)
+    print_plan(final["plan"])
+    if args.plan_only:
+        return
+    words = len(final["final_markdown"].split())
+    print(f"\n{len(final['sections'])} sections, {words} words.")
+    print(f"Saved: {os.path.relpath(final['file_path'])}")
+
+
 def main() -> int:
     """Command line entry point. Returns the process exit code."""
-    parser = argparse.ArgumentParser(description="Blog writing agent")
+    parser = argparse.ArgumentParser(
+        description="Blog writing agent: plans, researches (optional) and writes a blog post."
+    )
     parser.add_argument("topic", nargs="?", help="what the blog post is about")
-    parser.add_argument("--smoke", action="store_true", help="make one real call to verify setup")
+    parser.add_argument("--research", action="store_true", help="use web research (needs TAVILY_API_KEY)")
+    parser.add_argument("--images", action="store_true", help="generate images for the post")
+    parser.add_argument("--no-cache", action="store_true", help="ignore the disk cache and call the model")
+    parser.add_argument("--plan-only", action="store_true", help="only plan the post and print the plan")
+    parser.add_argument("--smoke", action="store_true", help="make one real call to verify the setup")
     args = parser.parse_args()
-    try:
-        if args.smoke:
-            smoke_test()
-            return 0
-        if not args.topic:
-            parser.print_help()
-            return 0
-        final = run_blog(build_graph(), initial_state(args.topic), print_progress)
-        print_plan(final["plan"])
-        words = len(final["final_markdown"].split())
-        print(f"\n{len(final['sections'])} sections, {words} words.")
-        print(f"Saved: {os.path.relpath(final['file_path'])}")
+    if not args.smoke and not args.topic:
+        parser.print_help()
         return 0
+    try:
+        smoke_test() if args.smoke else generate(args)
+        code = 0
     except AgentError as err:
-        print(f"Error: {redact(str(err))}", file=sys.stderr)
-        return 1
+        print(f"\nError: {redact(str(err))}", file=sys.stderr)
+        code = 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        code = 130
+    print(usage_summary())
+    return code
 
 
 if __name__ == "__main__":
