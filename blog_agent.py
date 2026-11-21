@@ -27,10 +27,11 @@ from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
 # =============================================================================
@@ -460,7 +461,7 @@ class EvidenceItem(BaseModel):
     published: str | None = None
 
 
-class State(TypedDict):
+class State(TypedDict, total=False):
     """The graph state. Nodes return partial updates that LangGraph merges in."""
 
     topic: str
@@ -478,6 +479,124 @@ class State(TypedDict):
     research_enabled: bool
     images_enabled: bool
     use_cache: bool
+
+
+# =============================================================================
+# 4. PROMPTS
+# =============================================================================
+# NOTE: the fake LLM reads the labelled lines ("TOPIC:", ...) in these prompts,
+# so keep the labels when you edit the wording.
+
+PLANNER_SYSTEM = """You are an expert blog editor. You plan blog posts.
+Plan the post as 4 to 6 sections: an introduction, body sections and a conclusion."""
+
+
+def planner_messages(topic: str) -> list[BaseMessage]:
+    """Prompt for the planner."""
+    return [SystemMessage(PLANNER_SYSTEM), HumanMessage(f"TOPIC: {topic}\n\nPlan the blog post.")]
+
+
+# =============================================================================
+# 5. NODES
+# =============================================================================
+
+
+def topic_of(prompt: str) -> str:
+    """Pull the 'TOPIC: ...' line out of a prompt (used by the fake LLM)."""
+    match = re.search(r"^TOPIC: (.+)$", prompt, re.MULTILINE)
+    return match.group(1).strip() if match else "the topic"
+
+
+@fake_output("Plan")
+def fake_plan(prompt: str) -> Plan:
+    """Fake planner output: an introduction, two body sections and a conclusion."""
+    topic = topic_of(prompt)
+    outline = [
+        (f"Why {topic} matters", 150),
+        (f"The core ideas behind {topic}", 300),
+        (f"A practical example of {topic}", 300),
+        ("Key takeaways", 150),
+    ]
+    tasks = [
+        Task(
+            id=number,
+            title=title,
+            brief=f"Section {number} of the post about {topic}.",
+            target_words=words,
+            needs_evidence=False,
+            image_prompt=None,
+        )
+        for number, (title, words) in enumerate(outline, start=1)
+    ]
+    return Plan(
+        blog_title=f"{topic}: A Practical Guide",
+        audience="curious developers",
+        tone="clear and friendly",
+        tasks=tasks,
+    )
+
+
+def orchestrator(state: State) -> dict:
+    """Planner node: one LLM call that turns the topic into a Plan."""
+    plan = call_llm(
+        "planner", planner_messages(state["topic"]), Plan, use_cache=state["use_cache"]
+    )
+    return {"plan": plan}
+
+
+# =============================================================================
+# 6. GRAPH
+# =============================================================================
+
+
+def build_graph():
+    """Build and compile the LangGraph workflow."""
+    graph = StateGraph(State)
+    graph.add_node("orchestrator", orchestrator)
+    graph.add_edge(START, "orchestrator")
+    graph.add_edge("orchestrator", END)
+    return graph.compile()
+
+
+def initial_state(topic: str, *, use_cache: bool = True) -> State:
+    """The state a run starts from."""
+    return {
+        "topic": topic,
+        "mode": "closed_book",
+        "queries": [],
+        "raw_results": [],
+        "chunks": [],
+        "evidence": [],
+        "sections": [],
+        "final_markdown": "",
+        "file_path": "",
+        "research_enabled": False,
+        "images_enabled": False,
+        "use_cache": use_cache,
+    }
+
+
+def stream_blog(graph, state: State):
+    """Run the graph and yield (node_name, update) each time a node finishes."""
+    for chunk in graph.stream(state, stream_mode="updates"):
+        for node, update in chunk.items():
+            yield node, update or {}
+
+
+def apply_update(state: State, update: dict) -> None:
+    """Merge a node's update into `state`, the way LangGraph does (sections are appended)."""
+    for key, value in update.items():
+        state[key] = state.get(key, []) + value if key == "sections" else value
+
+
+def run_blog(graph, state: State, on_progress: Callable[[str, dict], None] | None = None) -> State:
+    """Run the graph to the end and return the final state."""
+    final = dict(state)
+    for node, update in stream_blog(graph, state):
+        apply_update(final, update)
+        if on_progress:
+            on_progress(node, update)
+    return final
 
 
 # =============================================================================
@@ -511,16 +630,31 @@ def smoke_test() -> None:
     print(f"Smoke test passed. {usage_summary()}.")
 
 
+def print_plan(plan: Plan) -> None:
+    """Print the plan in a readable form."""
+    total = sum(task.target_words for task in plan.tasks)
+    print(f"\n{plan.blog_title}")
+    print(f"Audience: {plan.audience} | Tone: {plan.tone} | ~{total} words\n")
+    for task in plan.tasks:
+        print(f"  {task.id}. {task.title} (~{task.target_words} words)")
+        print(f"     {task.brief}")
+
+
 def main() -> int:
     """Command line entry point. Returns the process exit code."""
     parser = argparse.ArgumentParser(description="Blog writing agent")
+    parser.add_argument("topic", nargs="?", help="what the blog post is about")
     parser.add_argument("--smoke", action="store_true", help="make one real call to verify setup")
     args = parser.parse_args()
     try:
         if args.smoke:
             smoke_test()
             return 0
-        parser.print_help()
+        if not args.topic:
+            parser.print_help()
+            return 0
+        final = run_blog(build_graph(), initial_state(args.topic))
+        print_plan(final["plan"])
         return 0
     except AgentError as err:
         print(f"Error: {redact(str(err))}", file=sys.stderr)
