@@ -19,13 +19,15 @@ import sys
 import threading
 import time
 from datetime import date
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, ValidationError
 
@@ -105,7 +107,7 @@ def gemini_key() -> str:
 
 
 # =============================================================================
-# 2. QUOTA GUARD  (rate limiter, daily counter, disk cache, 429 backoff)
+# 2. QUOTA GUARD  (rate limiter, daily counter, disk cache, 429 backoff, fake LLM)
 # =============================================================================
 # The free tier allows 5 requests per minute and only 20 per day, so every model
 # call goes through `call_llm` below. In order, it:
@@ -114,6 +116,8 @@ def gemini_key() -> str:
 #   3. waits for the rate limiter attached to the model (4 per minute),
 #   4. retries with exponential backoff on 429 / 503 errors,
 #   5. retries once if the model returns invalid structured output.
+# With FAKE_LLM=1 the model is replaced by a deterministic stub, and steps 1-4
+# are skipped: no network, no quota, no cache. Use it to develop and test.
 
 # One limiter shared by every model instance. A bucket of 1 means no bursts:
 # calls are spaced 15 seconds apart, which keeps us under 5 per minute.
@@ -145,9 +149,65 @@ def build_llm(node: str) -> ChatGoogleGenerativeAI:
 
 
 @lru_cache(maxsize=None)
-def get_llm(node: str) -> ChatGoogleGenerativeAI:
-    """Return the model for a node, building it only once."""
+def real_llm(node: str) -> ChatGoogleGenerativeAI:
+    """Build the real model for a node only once."""
     return build_llm(node)
+
+
+def get_llm(node: str):
+    """Return the fake model when FAKE_LLM=1, otherwise the real Gemini model."""
+    return FakeLLM(node) if is_fake() else real_llm(node)
+
+
+# ---- fake LLM ----------------------------------------------------------------
+
+# Structured outputs of the fake model, keyed by schema class name. Each builder
+# takes the prompt text and returns a valid instance. Later sections register
+# their own builders next to the schemas they belong to.
+FAKE_STRUCTURED: dict[str, Callable[[str], BaseModel]] = {}
+
+
+def fake_output(schema_name: str):
+    """Decorator that registers a fake structured-output builder for a schema."""
+
+    def register(builder: Callable[[str], BaseModel]) -> Callable[[str], BaseModel]:
+        FAKE_STRUCTURED[schema_name] = builder
+        return builder
+
+    return register
+
+
+def is_fake() -> bool:
+    """True when FAKE_LLM=1. Read on every call so tests can switch it on."""
+    return os.getenv("FAKE_LLM") == "1"
+
+
+def prompt_text(messages: list[BaseMessage]) -> str:
+    """Join all message contents into one string."""
+    return "\n".join(str(message.content) for message in messages)
+
+
+def fake_text(prompt: str) -> str:
+    """Plain-text answer of the fake model."""
+    return "## Fake section\n\nThis is deterministic placeholder text from the fake LLM."
+
+
+class FakeLLM:
+    """Deterministic stand-in for the Gemini model (no network, no quota)."""
+
+    def __init__(self, node: str) -> None:
+        self.node = node
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        """Answer with plain text, like a chat model."""
+        return AIMessage(content=fake_text(prompt_text(messages)))
+
+    def with_structured_output(self, schema: type[BaseModel]) -> RunnableLambda:
+        """Return a runnable that builds a valid `schema` instance."""
+        builder = FAKE_STRUCTURED.get(schema.__name__)
+        if builder is None:
+            raise AgentError(f"The fake LLM has no builder for {schema.__name__}.")
+        return RunnableLambda(lambda messages: builder(prompt_text(messages)))
 
 
 # ---- persistent daily counter ------------------------------------------------
@@ -267,6 +327,8 @@ def backoff_seconds(err: BaseException, retry: int) -> float:
 
 def invoke_with_backoff(runnable, messages: list[BaseMessage]):
     """Invoke a model (or a model + parser chain) once, retrying on 429 / 503 errors."""
+    if is_fake():
+        return runnable.invoke(messages)  # no quota, no limiter, nothing to retry
     for retry in range(MAX_BACKOFF_RETRIES + 1):
         reserve_request()  # raises DailyQuotaError at the stop line
         try:
@@ -311,6 +373,7 @@ def call_llm(
     Invalid output (a parse error, a schema violation or empty text) is retried
     once, then raises StructuredOutputError.
     """
+    use_cache = use_cache and not is_fake()  # fake answers must never pollute the cache
     key = cache_key(node, messages, schema)
     if use_cache:
         cached = cache_get(key)
@@ -354,9 +417,15 @@ class SmokePing(BaseModel):
     message: str
 
 
+@fake_output("SmokePing")
+def fake_smoke_ping(prompt: str) -> SmokePing:
+    return SmokePing(ok=True, message="Hello from the fake LLM")
+
+
 def smoke_test() -> None:
     """Make ONE real call to check that the key, model name and structured output work."""
-    print(f"Model: {MODEL_NAME} (thinking level: {THINKING_LEVEL['router']})")
+    mode = "FAKE LLM, no real call" if is_fake() else f"thinking level: {THINKING_LEVEL['router']}"
+    print(f"Model: {MODEL_NAME} ({mode})")
     reply = call_llm(
         "router",
         [HumanMessage("Set ok to true and write a greeting of at most five words in message.")],
