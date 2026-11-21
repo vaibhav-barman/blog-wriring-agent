@@ -31,6 +31,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field, ValidationError
@@ -67,6 +68,9 @@ MAX_WAIT_SECONDS = 90  # never wait longer than this for one retry
 CACHE_DIR = ROOT / ".cache"
 USAGE_FILE = ROOT / ".usage.json"
 
+# Web research.
+MAX_RESULTS_PER_QUERY = 3  # Tavily results kept for each search query
+
 # Where finished posts are saved (gitignored except for .gitkeep).
 BLOGS_DIR = ROOT / "blogs"
 
@@ -92,6 +96,10 @@ class LLMCallError(AgentError):
 
 class StructuredOutputError(AgentError):
     """The model returned invalid structured output, even after one retry."""
+
+
+class ResearchError(AgentError):
+    """Every web search failed."""
 
 
 def redact(text: str) -> str:
@@ -640,8 +648,61 @@ def route_after_router(state: State) -> str:
     return "orchestrator" if state["mode"] == "closed_book" else "research"
 
 
+def search_web(queries: list[str]) -> list[dict]:
+    """Search the web with Tavily and return the raw results (at most 3 per query).
+
+    Each result is a dict with: query, title, url, content (a short summary),
+    raw_content (the page text, may be empty), published (a date string or None)
+    and score. One failing query is skipped with a warning; if all of them
+    fail we raise ResearchError. A missing key raises MissingKeyError.
+    """
+    if not research_available():
+        raise MissingKeyError("TAVILY_API_KEY is not set. Add it to .env to use web research.")
+    try:
+        tool = TavilySearch(
+            max_results=MAX_RESULTS_PER_QUERY, topic="general", include_raw_content="text"
+        )
+    except ValueError as err:  # the library raises this when it cannot find the key
+        raise MissingKeyError(f"Tavily is not configured: {redact(str(err))}") from err
+
+    results: list[dict] = []
+    failures: list[str] = []
+    for query in queries:
+        try:
+            response = tool.invoke({"query": query})
+        except Exception as err:  # network errors, bad key, rate limits...
+            failures.append(redact(str(err))[:150])
+            print(f"  Warning: search failed for {query!r}: {failures[-1]}", file=sys.stderr)
+            continue
+        for item in response.get("results", [])[:MAX_RESULTS_PER_QUERY]:
+            results.append(
+                {
+                    "query": query,
+                    "title": item.get("title") or item.get("url", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("content") or "",
+                    "raw_content": item.get("raw_content") or "",
+                    "published": item.get("published_date"),
+                    "score": item.get("score") or 0.0,
+                }
+            )
+    if queries and failures and not results:
+        raise ResearchError(f"Web search failed for every query. Last error: {failures[-1]}")
+    return results
+
+
+def to_evidence(result: dict) -> EvidenceItem:
+    """Convert a raw search result (or a chunk of one) into an EvidenceItem."""
+    return EvidenceItem(
+        title=result["title"],
+        url=result["url"],
+        snippet=(result["content"] or result["raw_content"])[:1000],
+        published=result.get("published"),
+    )
+
+
 def research(state: State) -> dict:
-    """Research node (no LLM call). The next commits fill this in: search, chunk, filter."""
+    """Research node (no LLM call). The next commits fill this in: chunk, filter, evidence."""
     return {}
 
 
