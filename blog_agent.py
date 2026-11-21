@@ -523,6 +523,24 @@ STYLE_GUIDE = """Style guide for the whole post:
 - Write for the audience and in the tone set by the plan. Plain Markdown only, no HTML.
 - Make a point once, then move on. No padding."""
 
+ROUTER_SYSTEM = """You decide whether a blog post needs fresh facts from the web before it is planned.
+
+Choose exactly one mode:
+- closed_book: the topic is timeless (concepts, how-to guides, fundamentals). Your own knowledge is enough.
+- hybrid: the topic is mostly timeless, but a few facts may be recent or worth checking (tools, versions, benchmarks, adoption numbers).
+- open_book: the topic is time-sensitive and relies on current facts (news, releases, prices, rankings, "latest", recent events).
+
+For hybrid and open_book, return 2 to 4 short web search queries (3 to 8 words each) that would find the facts the post needs.
+For closed_book, return an empty list of queries.
+Add a one-sentence reason."""
+
+
+def router_messages(topic: str) -> list[BaseMessage]:
+    """Prompt for the router."""
+    human = f"TOPIC: {topic}\nCURRENT YEAR: {date.today().year}\n\nChoose the mode and the queries."
+    return [SystemMessage(ROUTER_SYSTEM), HumanMessage(human)]
+
+
 PLANNER_SYSTEM = f"""You are an expert blog editor. You turn a topic into a plan for a blog post.
 Several writers will each write one section without seeing each other's work, so the plan must keep them apart.
 
@@ -578,6 +596,53 @@ Write this section now. Start with the heading "## {task.title}"."""
 # =============================================================================
 # 5. NODES
 # =============================================================================
+
+
+# Words the fake router looks for in the topic (the real router uses the model).
+FAKE_OPEN_BOOK_WORDS = ("latest", "news", "this year", "release", "price", "2025", "2026")
+FAKE_HYBRID_WORDS = ("best", "tools", "compare", " vs ", "trends", "state of")
+
+
+@fake_output("RouterDecision")
+def fake_router_decision(prompt: str) -> RouterDecision:
+    """Fake router output, chosen by keywords in the topic."""
+    topic = labelled(prompt, "TOPIC", "the topic")
+    lowered = f" {topic.lower()} "
+    if any(word in lowered for word in FAKE_OPEN_BOOK_WORDS):
+        mode: Mode = "open_book"
+    elif any(word in lowered for word in FAKE_HYBRID_WORDS):
+        mode = "hybrid"
+    else:
+        mode = "closed_book"
+    queries = [] if mode == "closed_book" else [topic, f"{topic} overview"]
+    return RouterDecision(mode=mode, queries=queries, reason=f"Fake router chose {mode}.")
+
+
+def router(state: State) -> dict:
+    """Router node: decide how much the post depends on fresh web facts.
+
+    With research disabled (no --research flag, or no Tavily key) this forces
+    closed_book without calling the model, which saves one request.
+    """
+    if not state["research_enabled"]:
+        return {"mode": "closed_book", "queries": []}
+    decision = call_llm(
+        "router", router_messages(state["topic"]), RouterDecision, use_cache=state["use_cache"]
+    )
+    if decision.mode == "closed_book":
+        return {"mode": "closed_book", "queries": []}
+    queries = [query.strip() for query in decision.queries if query.strip()][:4]
+    return {"mode": decision.mode, "queries": queries or [state["topic"]]}
+
+
+def route_after_router(state: State) -> str:
+    """Conditional edge: go and research, or straight to planning."""
+    return "orchestrator" if state["mode"] == "closed_book" else "research"
+
+
+def research(state: State) -> dict:
+    """Research node (no LLM call). The next commits fill this in: search, chunk, filter."""
+    return {}
 
 
 @fake_output("Plan")
@@ -695,10 +760,16 @@ def reducer(state: State) -> dict:
 def build_graph():
     """Build and compile the LangGraph workflow."""
     graph = StateGraph(State)
+    graph.add_node("router", router)
+    graph.add_node("research", research)
     graph.add_node("orchestrator", orchestrator)
     graph.add_node("worker", worker)
     graph.add_node("reducer", reducer)
-    graph.add_edge(START, "orchestrator")
+    graph.add_edge(START, "router")
+    graph.add_conditional_edges(
+        "router", route_after_router, {"research": "research", "orchestrator": "orchestrator"}
+    )
+    graph.add_edge("research", "orchestrator")
     graph.add_conditional_edges("orchestrator", fan_out, ["worker"])
     graph.add_edge("worker", "reducer")  # runs once, after every worker has finished
     graph.add_edge("reducer", END)
@@ -805,14 +876,21 @@ def print_progress(node: str, update: dict) -> None:
     if node == "worker":
         task_id, markdown = update["sections"][0]
         print(f"  [worker] section {task_id} written ({len(markdown.split())} words)")
+    elif node == "router":
+        print(f"  [router] mode: {update['mode']}")
     else:
         print(f"  [{node}] done")
 
 
 def generate(args: argparse.Namespace) -> None:
     """Run the agent for one topic and print the result."""
-    if args.research or args.images:
-        print("Note: --research and --images are accepted but not active yet.")
+    if args.research and not research_available():
+        print(
+            "Warning: --research ignored because TAVILY_API_KEY is not set (add it to .env).",
+            file=sys.stderr,
+        )
+    if args.images:
+        print("Note: --images is accepted but not active yet.")
     state = initial_state(
         args.topic,
         research=args.research,
