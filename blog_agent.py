@@ -32,6 +32,7 @@ from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_tavily import TavilySearch
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field, ValidationError
@@ -70,6 +71,13 @@ USAGE_FILE = ROOT / ".usage.json"
 
 # Web research.
 MAX_RESULTS_PER_QUERY = 3  # Tavily results kept for each search query
+CHUNK_SIZE = 1000  # maximum characters in one chunk of a web page
+CHUNK_OVERLAP = 200  # characters shared by neighbouring chunks, so no sentence loses its context
+MIN_CHUNK_CHARS = 100  # shorter chunks are page furniture (menus, buttons), not content
+DUPLICATE_SIMILARITY = 0.8  # word overlap at which two chunks count as near-duplicates
+CHUNKS_PER_QUERY = 4  # best chunks kept for each search query
+EVIDENCE_TOKEN_BUDGET = 2500  # upper limit for all evidence passed to the planner and writers
+CHARS_PER_TOKEN = 4  # rough size of a token, enough to enforce the budget
 
 # Where finished posts are saved (gitignored except for .gitkeep).
 BLOGS_DIR = ROOT / "blogs"
@@ -701,9 +709,105 @@ def to_evidence(result: dict) -> EvidenceItem:
     )
 
 
+# Common words that say nothing about relevance, ignored when matching keywords.
+STOPWORDS = frozenset(
+    "a an and are as at be by do does for from how in is it of on or that the this to vs was were "
+    "what when where which who why will with you your".split()
+)
+
+
+def words_of(text: str) -> set[str]:
+    """The meaningful lowercase words of a text, as a set."""
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 1 and w not in STOPWORDS}
+
+
+def chunk_results(results: list[dict]) -> list[dict]:
+    """Split the text of every search result into overlapping chunks.
+
+    Uses the full page text when we have it, otherwise the short summary. Each
+    chunk keeps the query, title, url and date of the page it came from.
+    """
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    chunks = []
+    for result in results:
+        for piece in splitter.split_text(result["raw_content"] or result["content"]):
+            if len(piece.strip()) < MIN_CHUNK_CHARS:
+                continue
+            chunks.append(
+                {
+                    "query": result["query"],
+                    "title": result["title"],
+                    "url": result["url"],
+                    "published": result.get("published"),
+                    "content": piece.strip(),
+                    "raw_content": "",
+                    "score": 0.0,
+                }
+            )
+    return chunks
+
+
+def dedupe_chunks(chunks: list[dict]) -> list[dict]:
+    """Drop chunks whose words overlap too much with a chunk we already kept."""
+    kept: list[dict] = []
+    kept_words: list[set[str]] = []
+    for chunk in chunks:
+        words = words_of(chunk["content"])
+        if not words:
+            continue
+        for other in kept_words:
+            if len(words & other) / len(words | other) >= DUPLICATE_SIMILARITY:
+                break
+        else:  # no near-duplicate found
+            kept.append(chunk)
+            kept_words.append(words)
+    return kept
+
+
+def select_chunks(chunks: list[dict], queries: list[str]) -> list[dict]:
+    """Keep the best chunks per query, within the evidence token budget.
+
+    A chunk's score is the share of the query's keywords it contains. Queries
+    take turns (best chunk of each first, then the second best, ...) so that no
+    single query uses up the whole budget.
+    """
+    ranked: dict[str, list[dict]] = {}
+    for query in queries:
+        keywords = words_of(query)
+        own = [chunk for chunk in chunks if chunk["query"] == query]
+        for chunk in own:
+            chunk["score"] = len(keywords & words_of(chunk["content"])) / max(len(keywords), 1)
+        relevant = [chunk for chunk in own if chunk["score"] > 0]  # no keyword match = no use
+        ranked[query] = sorted(relevant, key=lambda chunk: -chunk["score"])[:CHUNKS_PER_QUERY]
+
+    selected: list[dict] = []
+    used_chars = 0
+    for rank in range(CHUNKS_PER_QUERY):
+        for query in queries:
+            if rank < len(ranked[query]):
+                chunk = ranked[query][rank]
+                if used_chars + len(chunk["content"]) <= EVIDENCE_TOKEN_BUDGET * CHARS_PER_TOKEN:
+                    selected.append(chunk)
+                    used_chars += len(chunk["content"])
+    return selected
+
+
 def research(state: State) -> dict:
-    """Research node (no LLM call). The next commits fill this in: chunk, filter, evidence."""
-    return {}
+    """Research node (no LLM call): search, split into chunks, drop duplicates, keep the best."""
+    queries = state["queries"]
+    try:
+        results = search_web(queries)
+    except ResearchError as err:  # carry on without evidence rather than failing the whole run
+        print(f"  Warning: {err} Continuing without research.", file=sys.stderr)
+        return {"raw_results": [], "chunks": [], "evidence": []}
+    all_chunks = chunk_results(results)
+    chunks = dedupe_chunks(all_chunks)
+    evidence = [to_evidence(chunk) for chunk in select_chunks(chunks, queries)]
+    print(
+        f"  [research] {len(results)} results -> {len(all_chunks)} chunks in, "
+        f"{len(chunks)} after removing duplicates, {len(evidence)} kept"
+    )
+    return {"raw_results": results, "chunks": chunks, "evidence": evidence}
 
 
 @fake_output("Plan")
