@@ -13,15 +13,17 @@ organised in clearly marked sections, in this order:
 import argparse
 import hashlib
 import json
+import operator
 import os
 import re
 import sys
 import threading
 import time
-from datetime import date
 from collections.abc import Callable
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.exceptions import OutputParserException
@@ -29,7 +31,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 # =============================================================================
 # 1. CONFIG
@@ -403,6 +405,79 @@ def call_llm(
         return result
     what = schema.__name__ if schema else "text"
     raise StructuredOutputError(f"The model returned invalid {what} output twice ({problem}).")
+
+
+# =============================================================================
+# 3. SCHEMAS AND GRAPH STATE
+# =============================================================================
+
+# How much the post depends on fresh facts from the web.
+Mode = Literal["closed_book", "hybrid", "open_book"]
+
+
+class Task(BaseModel):
+    """One section of the blog post."""
+
+    id: int = Field(description="1-based position of the section in the post")
+    title: str = Field(description="Specific, descriptive section title")
+    brief: str = Field(
+        description="2-3 sentences: what this section covers and what it leaves to other sections"
+    )
+    target_words: int = Field(ge=50, le=800, description="Target length of the section in words")
+    needs_evidence: bool = Field(
+        description="True only if this section relies on the supplied research evidence"
+    )
+    image_prompt: str | None = Field(
+        description="Prompt for one illustration for this section, or null for no image"
+    )
+
+
+class Plan(BaseModel):
+    """The plan for the whole blog post."""
+
+    blog_title: str = Field(description="Title of the post")
+    audience: str = Field(description="Who the post is written for")
+    tone: str = Field(description="Voice and tone to use in every section")
+    tasks: list[Task] = Field(min_length=4, max_length=6, description="The sections, in order")
+
+
+class RouterDecision(BaseModel):
+    """The router's decision about web research."""
+
+    mode: Mode = Field(description="closed_book, hybrid or open_book")
+    queries: list[str] = Field(
+        max_length=4, description="2-4 short web search queries, or an empty list for closed_book"
+    )
+    reason: str = Field(description="One sentence explaining the decision")
+
+
+class EvidenceItem(BaseModel):
+    """One piece of research evidence (a chunk of a web page)."""
+
+    title: str
+    url: str
+    snippet: str
+    published: str | None = None
+
+
+class State(TypedDict):
+    """The graph state. Nodes return partial updates that LangGraph merges in."""
+
+    topic: str
+    mode: Mode
+    queries: list[str]
+    raw_results: list[dict]  # raw web search results
+    chunks: list[dict]  # text chunks cut from those results
+    evidence: list[EvidenceItem]  # the chunks we kept
+    plan: Plan
+    # Parallel workers each append one (task_id, markdown) pair; operator.add merges them.
+    sections: Annotated[list[tuple[int, str]], operator.add]
+    final_markdown: str
+    file_path: str
+    # Options for this run.
+    research_enabled: bool
+    images_enabled: bool
+    use_cache: bool
 
 
 # =============================================================================
