@@ -67,6 +67,9 @@ MAX_WAIT_SECONDS = 90  # never wait longer than this for one retry
 CACHE_DIR = ROOT / ".cache"
 USAGE_FILE = ROOT / ".usage.json"
 
+# Where finished posts are saved (gitignored except for .gitkeep).
+BLOGS_DIR = ROOT / "blogs"
+
 # Environment variables that hold secrets. Their values are never printed.
 SECRET_ENV_VARS = ("GEMINI_API_KEY", "TAVILY_API_KEY")
 
@@ -624,6 +627,27 @@ def worker(payload: WorkerInput) -> dict:
     return {"sections": [(task.id, normalize_section(task.title, text))]}
 
 
+def slugify(text: str, max_length: int = 60) -> str:
+    """Turn a title into a safe file name, e.g. 'Hello, World!' -> 'hello-world'."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_length].strip("-") or "blog"
+
+
+def reducer(state: State) -> dict:
+    """Reducer node (no LLM call): order the sections, add the title and save the post."""
+    plan = state["plan"]
+    written = dict(state["sections"])
+    missing = [task.title for task in plan.tasks if task.id not in written]
+    if missing:
+        raise AgentError(f"Sections are missing from the post: {', '.join(missing)}")
+    ordered = [written[task_id] for task_id in sorted(written)]
+    markdown = "\n\n".join([f"# {plan.blog_title}", *ordered]).strip() + "\n"
+    BLOGS_DIR.mkdir(exist_ok=True)
+    path = BLOGS_DIR / f"{slugify(plan.blog_title)}.md"
+    path.write_text(markdown, encoding="utf-8")
+    return {"final_markdown": markdown, "file_path": str(path)}
+
+
 # =============================================================================
 # 6. GRAPH
 # =============================================================================
@@ -634,9 +658,11 @@ def build_graph():
     graph = StateGraph(State)
     graph.add_node("orchestrator", orchestrator)
     graph.add_node("worker", worker)
+    graph.add_node("reducer", reducer)
     graph.add_edge(START, "orchestrator")
     graph.add_conditional_edges("orchestrator", fan_out, ["worker"])
-    graph.add_edge("worker", END)
+    graph.add_edge("worker", "reducer")  # runs once, after every worker has finished
+    graph.add_edge("reducer", END)
     return graph.compile()
 
 
@@ -746,8 +772,9 @@ def main() -> int:
             return 0
         final = run_blog(build_graph(), initial_state(args.topic), print_progress)
         print_plan(final["plan"])
-        words = sum(len(markdown.split()) for _, markdown in final["sections"])
-        print(f"\n{len(final['sections'])} sections written, {words} words in total.")
+        words = len(final["final_markdown"].split())
+        print(f"\n{len(final['sections'])} sections, {words} words.")
+        print(f"Saved: {os.path.relpath(final['file_path'])}")
         return 0
     except AgentError as err:
         print(f"Error: {redact(str(err))}", file=sys.stderr)
