@@ -69,6 +69,8 @@ REQUESTS_PER_MINUTE = 4  # safely below the 5 per minute limit
 MAX_BACKOFF_RETRIES = 3  # retries after a 429 or 503 error
 BACKOFF_BASE_SECONDS = 15  # waits 15s, 30s, 60s (doubling each time)
 MAX_WAIT_SECONDS = 90  # never wait longer than this for one retry
+OUTAGE_STOP_AFTER = 4  # consecutive 503 errors (across all calls) after which we stop trying
+OUTAGE_COOLDOWN_SECONDS = 120  # how long we refuse to call a model that just looked down
 
 # Local runtime state (both are gitignored).
 CACHE_DIR = ROOT / ".cache"
@@ -87,7 +89,7 @@ MAX_CHUNKS_PER_DOMAIN = 2  # so that one website cannot dominate the evidence
 RECENT_DAYS = 90  # open_book: results this young get the big recency bonus
 RECENCY_BONUS = 0.3  # added to the keyword score of chunks from recent pages
 YEAR_BONUS = 0.1  # added for pages younger than a year
-THIN_EVIDENCE_ITEMS = 3  # with fewer evidence items than this, the post says so
+THIN_EVIDENCE_SOURCES = 3  # with fewer different websites than this, the post says so
 
 # Where finished posts and their images are saved (gitignored except for .gitkeep).
 BLOGS_DIR = ROOT / "blogs"
@@ -380,28 +382,71 @@ def backoff_seconds(err: BaseException, retry: int) -> float:
     return min(wait, MAX_WAIT_SECONDS)
 
 
+# Circuit breaker for outages. Parallel workers would otherwise each retry on
+# their own and burn several requests of the daily quota on a model that is down.
+_outage_lock = threading.Lock()
+_outage = {"failures": 0, "last": 0.0}
+
+
+def note_outage(failed: bool) -> None:
+    """Record a 503 (failed=True) or a success (failed=False) for the breaker."""
+    with _outage_lock:
+        now = time.monotonic()
+        if not failed or now - _outage["last"] > OUTAGE_COOLDOWN_SECONDS:
+            _outage["failures"] = 0  # a success, or an old outage that has passed
+        if failed:
+            _outage["failures"] += 1
+            _outage["last"] = now
+
+
+def outage_is_open() -> bool:
+    """True while recent 503 errors say the model is down and we should not call it."""
+    with _outage_lock:
+        recent = time.monotonic() - _outage["last"] <= OUTAGE_COOLDOWN_SECONDS
+        return _outage["failures"] >= OUTAGE_STOP_AFTER and recent
+
+
+def outage_error(detail: str = "") -> LLMCallError:
+    """The error shown when the breaker is open or retries ran out on 503s."""
+    return LLMCallError(
+        "The model is overloaded (repeated 503 errors), so the run was stopped to save your "
+        "daily quota. Wait a few minutes and run the same command again: finished calls are "
+        "cached, so nothing is repeated." + (f" Last error: {detail}" if detail else "")
+    )
+
+
 def invoke_with_backoff(runnable, messages: list[BaseMessage]):
     """Invoke a model (or a model + parser chain) once, retrying on 429 / 503 errors."""
     if is_fake():
         return runnable.invoke(messages)  # no quota, no limiter, nothing to retry
     for retry in range(MAX_BACKOFF_RETRIES + 1):
+        if outage_is_open():
+            raise outage_error()  # fail fast, without spending a request
         reserve_request()  # raises DailyQuotaError at the stop line
         try:
-            return runnable.invoke(messages)
+            response = runnable.invoke(messages)
+            note_outage(failed=False)
+            return response
         except (OutputParserException, ValidationError):
+            note_outage(failed=False)  # the model answered, the answer was just invalid
             raise  # invalid output is handled by the caller, not retried here
         except Exception as err:
             kind = classify_error(err)
+            if kind == "unavailable":
+                note_outage(failed=True)
             if kind == "daily":
                 raise DailyQuotaError(
                     "Google says the daily quota for this model is used up. Try again tomorrow."
                 ) from err
             if kind == "other":
                 raise LLMCallError(f"The model call failed: {redact(str(err))[:300]}") from err
+            if kind == "unavailable" and outage_is_open():
+                raise outage_error(redact(str(err))[:200]) from err
             if retry == MAX_BACKOFF_RETRIES:
-                what = "rate limit" if kind == "rate_limit" else "temporary outage"
+                if kind == "unavailable":
+                    raise outage_error(redact(str(err))[:200]) from err
                 raise LLMCallError(
-                    f"The model is still hitting a {what} after {MAX_BACKOFF_RETRIES} retries. "
+                    f"The model is still hitting a rate limit after {MAX_BACKOFF_RETRIES} retries. "
                     f"Wait a minute and run the same command again (finished calls are cached). "
                     f"Last error: {redact(str(err))[:200]}"
                 ) from err
@@ -1153,15 +1198,19 @@ def sources_section(body: str, evidence: list[EvidenceItem]) -> str:
 
 
 def evidence_note(mode: Mode, evidence: list[EvidenceItem]) -> str:
-    """An honest note for posts that were meant to use research but found little (or '')."""
-    if mode == "closed_book" or len(evidence) >= THIN_EVIDENCE_ITEMS:
+    """An honest note for posts that were meant to use research but found little (or '').
+
+    "Little" means fewer than THIN_EVIDENCE_SOURCES different sources: ten chunks
+    from one page are still one source.
+    """
+    count = len({item.url for item in evidence})
+    if mode == "closed_book" or count >= THIN_EVIDENCE_SOURCES:
         return ""
-    if not evidence:
+    if count == 0:
         return (
             "> **Note:** Web research found no usable sources for this topic, so this post "
             "relies on general knowledge and may be out of date."
         )
-    count = len({item.url for item in evidence})
     return (
         f"> **Note:** Web research found only {count} source{'s' if count != 1 else ''}, so some "
         "details may be incomplete or out of date. Check the linked sources before relying on them."
