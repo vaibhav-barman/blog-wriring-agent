@@ -512,11 +512,31 @@ class State(TypedDict, total=False):
 # =============================================================================
 # 4. PROMPTS
 # =============================================================================
-# NOTE: the fake LLM reads the labelled lines ("TOPIC:", ...) in these prompts,
-# so keep the labels when you edit the wording.
+# NOTE: the fake LLM reads the labelled lines ("TOPIC:", "SECTION TITLE:", ...)
+# in the human messages, so keep those labels when you edit the wording.
 
-PLANNER_SYSTEM = """You are an expert blog editor. You plan blog posts.
-Plan the post as 4 to 6 sections: an introduction, body sections and a conclusion."""
+# Shared by the planner and the writers so the whole post sounds like one author.
+STYLE_GUIDE = """Style guide for the whole post:
+- Clear structure: short paragraphs. Use bullet points or numbered steps only where they make the content easier to scan.
+- Concrete examples: prefer a specific example, number, short code snippet or scenario over an abstract statement.
+- No filler and no marketing language. Never write phrases like "in today's fast-paced world", "game-changer", "unlock the power", "delve into", "revolutionize" or "it is important to note".
+- Write for the audience and in the tone set by the plan. Plain Markdown only, no HTML.
+- Make a point once, then move on. No padding."""
+
+PLANNER_SYSTEM = f"""You are an expert blog editor. You turn a topic into a plan for a blog post.
+Several writers will each write one section without seeing each other's work, so the plan must keep them apart.
+
+{STYLE_GUIDE}
+
+Planning rules:
+- Plan 4 or 5 sections (never more than 6): the introduction first, the conclusion last, and 2 or 3 body sections between them.
+- Word targets: introduction 100-180, each body section 250-400, conclusion 100-180. The total must land between 1000 and 1800 words.
+- Section titles are specific and describe the content. Do not use a bare "Introduction" or "Conclusion".
+- No overlapping sections. Each brief states in 2 or 3 sentences what the section covers and names one thing it leaves to another section.
+- Order the sections so that each one builds on the previous one.
+- Number the sections 1, 2, 3, ... in reading order.
+- Pick a specific audience and a tone (for example "practical and friendly") that fit the topic.
+- image_prompt is null for every section."""
 
 
 def planner_messages(topic: str) -> list[BaseMessage]:
@@ -524,21 +544,29 @@ def planner_messages(topic: str) -> list[BaseMessage]:
     return [SystemMessage(PLANNER_SYSTEM), HumanMessage(f"TOPIC: {topic}\n\nPlan the blog post.")]
 
 
-WRITER_SYSTEM = """You are a skilled blog writer.
-You write exactly one section of a blog post, in Markdown."""
+WRITER_SYSTEM = f"""You are a skilled blog writer. You write exactly ONE section of a blog post, in Markdown.
+
+{STYLE_GUIDE}
+
+Rules for your section:
+- Write only this section. Start with the heading "## <section title>" and use "###" for any sub-headings.
+- Stay inside the scope of your section brief. Other writers cover the other sections of the outline: do not repeat their content, do not introduce or summarise the whole post (unless your section is the introduction or the conclusion) and do not add a post title.
+- Aim for the target word count, within about 15%.
+- Output only the Markdown of the section: no preamble, no notes and no code fence around the answer."""
 
 
 def worker_messages(topic: str, plan: Plan, task: Task) -> list[BaseMessage]:
     """Prompt for the worker that writes one section."""
-    outline = "\n".join(f"{t.id}. {t.title}" for t in plan.tasks)
+    outline = "\n".join(f"{t.id}. {t.title}: {t.brief}" for t in plan.tasks)
     human = f"""TOPIC: {topic}
 BLOG TITLE: {plan.blog_title}
 AUDIENCE: {plan.audience}
 TONE: {plan.tone}
 
-FULL OUTLINE:
+FULL OUTLINE (every section, with its scope):
 {outline}
 
+YOU ARE WRITING SECTION {task.id} OF {len(plan.tasks)}.
 SECTION TITLE: {task.title}
 SECTION BRIEF: {task.brief}
 TARGET WORDS: {task.target_words}
@@ -581,12 +609,19 @@ def fake_plan(prompt: str) -> Plan:
     )
 
 
+def clean_plan(plan: Plan) -> Plan:
+    """Safety net: put tasks in id order and renumber them 1, 2, 3, ... without gaps."""
+    ordered = sorted(plan.tasks, key=lambda task: task.id)
+    tasks = [task.model_copy(update={"id": number}) for number, task in enumerate(ordered, start=1)]
+    return plan.model_copy(update={"tasks": tasks})
+
+
 def orchestrator(state: State) -> dict:
     """Planner node: one LLM call that turns the topic into a Plan."""
     plan = call_llm(
         "planner", planner_messages(state["topic"]), Plan, use_cache=state["use_cache"]
     )
-    return {"plan": plan}
+    return {"plan": clean_plan(plan)}
 
 
 def fan_out(state: State) -> list[Send]:
