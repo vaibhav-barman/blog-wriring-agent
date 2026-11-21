@@ -1,0 +1,19 @@
+[project]
+name = "blog-writing-agent"
+version = "0.1.0"
+description = "An AI blog writing agent built with LangGraph and Gemini"
+readme = "README.md"
+authors = [
+    { name = "Vaibhav", email = "vaibhavbarman2609@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "langchain>=1.5.2",
+    "langchain-core>=1.8.4",
+    "langchain-google-genai>=4.5.2",
+    "langgraph>=1.2.24",
+    "pandas>=3.1.1",
+    "pydantic>=2.14.4",
+    "python-dotenv>=1.2.4",
+    "streamlit>=1.67.0",
+]
