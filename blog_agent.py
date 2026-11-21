@@ -32,6 +32,7 @@ from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from pydantic import BaseModel, Field, ValidationError
 
 # =============================================================================
@@ -190,9 +191,22 @@ def prompt_text(messages: list[BaseMessage]) -> str:
     return "\n".join(str(message.content) for message in messages)
 
 
+def labelled(prompt: str, label: str, default: str = "") -> str:
+    """Value of a 'LABEL: value' line in a prompt (this is how the fake LLM reads prompts)."""
+    match = re.search(rf"^{label}: (.+)$", prompt, re.MULTILINE)
+    return match.group(1).strip() if match else default
+
+
 def fake_text(prompt: str) -> str:
-    """Plain-text answer of the fake model."""
-    return "## Fake section\n\nThis is deterministic placeholder text from the fake LLM."
+    """Plain-text answer of the fake model: a short section written from the prompt labels."""
+    title = labelled(prompt, "SECTION TITLE", "Fake section")
+    topic = labelled(prompt, "TOPIC", "the topic")
+    brief = labelled(prompt, "SECTION BRIEF")
+    return (
+        f"## {title}\n\n"
+        f"This section of the post about {topic} is placeholder text from the fake LLM. {brief}\n\n"
+        "A second short paragraph keeps the section looking like real prose."
+    )
 
 
 class FakeLLM:
@@ -461,6 +475,15 @@ class EvidenceItem(BaseModel):
     published: str | None = None
 
 
+class WorkerInput(TypedDict):
+    """What each parallel worker receives (sent with `Send`, not part of the shared state)."""
+
+    topic: str
+    plan: Plan
+    task: Task
+    use_cache: bool
+
+
 class State(TypedDict, total=False):
     """The graph state. Nodes return partial updates that LangGraph merges in."""
 
@@ -496,21 +519,38 @@ def planner_messages(topic: str) -> list[BaseMessage]:
     return [SystemMessage(PLANNER_SYSTEM), HumanMessage(f"TOPIC: {topic}\n\nPlan the blog post.")]
 
 
+WRITER_SYSTEM = """You are a skilled blog writer.
+You write exactly one section of a blog post, in Markdown."""
+
+
+def worker_messages(topic: str, plan: Plan, task: Task) -> list[BaseMessage]:
+    """Prompt for the worker that writes one section."""
+    outline = "\n".join(f"{t.id}. {t.title}" for t in plan.tasks)
+    human = f"""TOPIC: {topic}
+BLOG TITLE: {plan.blog_title}
+AUDIENCE: {plan.audience}
+TONE: {plan.tone}
+
+FULL OUTLINE:
+{outline}
+
+SECTION TITLE: {task.title}
+SECTION BRIEF: {task.brief}
+TARGET WORDS: {task.target_words}
+
+Write this section now. Start with the heading "## {task.title}"."""
+    return [SystemMessage(WRITER_SYSTEM), HumanMessage(human)]
+
+
 # =============================================================================
 # 5. NODES
 # =============================================================================
 
 
-def topic_of(prompt: str) -> str:
-    """Pull the 'TOPIC: ...' line out of a prompt (used by the fake LLM)."""
-    match = re.search(r"^TOPIC: (.+)$", prompt, re.MULTILINE)
-    return match.group(1).strip() if match else "the topic"
-
-
 @fake_output("Plan")
 def fake_plan(prompt: str) -> Plan:
     """Fake planner output: an introduction, two body sections and a conclusion."""
-    topic = topic_of(prompt)
+    topic = labelled(prompt, "TOPIC", "the topic")
     outline = [
         (f"Why {topic} matters", 150),
         (f"The core ideas behind {topic}", 300),
@@ -544,6 +584,46 @@ def orchestrator(state: State) -> dict:
     return {"plan": plan}
 
 
+def fan_out(state: State) -> list[Send]:
+    """Conditional edge: send one worker per task in the plan. They run in parallel."""
+    return [
+        Send(
+            "worker",
+            {
+                "topic": state["topic"],
+                "plan": state["plan"],
+                "task": task,
+                "use_cache": state["use_cache"],
+            },
+        )
+        for task in state["plan"].tasks
+    ]
+
+
+def normalize_section(title: str, text: str) -> str:
+    """Make sure a section is plain Markdown that starts with '## <title>'."""
+    text = text.strip()
+    fenced = re.match(r"^```(?:markdown|md)?\s*\n(.*)\n```$", text, re.DOTALL)
+    if fenced:  # the model wrapped the whole answer in a code fence
+        text = fenced.group(1).strip()
+    lines = text.splitlines()
+    if lines and re.match(r"^#{1,6}\s", lines[0]):
+        lines = lines[1:]  # drop whatever heading the model chose; the plan's title wins
+    body = "\n".join(lines).strip()
+    return f"## {title}\n\n{body}"
+
+
+def worker(payload: WorkerInput) -> dict:
+    """Worker node: one LLM call that writes one section. Returns [(task_id, markdown)]."""
+    task = payload["task"]
+    text = call_llm(
+        "writer",
+        worker_messages(payload["topic"], payload["plan"], task),
+        use_cache=payload["use_cache"],
+    )
+    return {"sections": [(task.id, normalize_section(task.title, text))]}
+
+
 # =============================================================================
 # 6. GRAPH
 # =============================================================================
@@ -553,8 +633,10 @@ def build_graph():
     """Build and compile the LangGraph workflow."""
     graph = StateGraph(State)
     graph.add_node("orchestrator", orchestrator)
+    graph.add_node("worker", worker)
     graph.add_edge(START, "orchestrator")
-    graph.add_edge("orchestrator", END)
+    graph.add_conditional_edges("orchestrator", fan_out, ["worker"])
+    graph.add_edge("worker", END)
     return graph.compile()
 
 
@@ -640,6 +722,15 @@ def print_plan(plan: Plan) -> None:
         print(f"     {task.brief}")
 
 
+def print_progress(node: str, update: dict) -> None:
+    """Print one line each time a graph node finishes."""
+    if node == "worker":
+        task_id, markdown = update["sections"][0]
+        print(f"  [worker] section {task_id} written ({len(markdown.split())} words)")
+    else:
+        print(f"  [{node}] done")
+
+
 def main() -> int:
     """Command line entry point. Returns the process exit code."""
     parser = argparse.ArgumentParser(description="Blog writing agent")
@@ -653,8 +744,10 @@ def main() -> int:
         if not args.topic:
             parser.print_help()
             return 0
-        final = run_blog(build_graph(), initial_state(args.topic))
+        final = run_blog(build_graph(), initial_state(args.topic), print_progress)
         print_plan(final["plan"])
+        words = sum(len(markdown.split()) for _, markdown in final["sections"])
+        print(f"\n{len(final['sections'])} sections written, {words} words in total.")
         return 0
     except AgentError as err:
         print(f"Error: {redact(str(err))}", file=sys.stderr)
